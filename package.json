@@ -7,11 +7,16 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "tunnel": "npx --yes localtunnel --port 4173 --subdomain troub-port-tool",
+    "public": "npm run build && vite preview"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.110.3",
+    "pdfjs-dist": "^6.1.200",
     "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "react-dom": "^19.2.7",
+    "tesseract.js": "^7.0.0"
   },
   "devDependencies": {
     "@types/react": "^19.2.17",
