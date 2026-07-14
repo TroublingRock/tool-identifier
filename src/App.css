@@ -505,9 +505,65 @@ code {
   width: 100%;
   height: auto;
   display: block;
-  max-height: 70vh;
+  max-height: min(58vh, 520px);
   cursor: grab;
   background: #0b1520;
+}
+
+.optical-dock {
+  position: sticky;
+  bottom: 0;
+  z-index: 30;
+  margin-top: 10px;
+  padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px));
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.96);
+  backdrop-filter: blur(10px);
+  display: grid;
+  gap: 8px;
+  box-shadow: 0 -8px 24px rgba(15, 23, 42, 0.08);
+}
+
+.optical-dock-row {
+  display: grid;
+  grid-template-columns: 1fr 1.4fr;
+  gap: 8px;
+}
+
+.optical-dock-row .arm-btn,
+.optical-dock-row .btn {
+  min-height: 48px;
+  font-size: 1rem;
+}
+
+.optical-dock-modes {
+  flex-wrap: wrap;
+}
+
+.optical-dock-progress {
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+.optical-settings {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  background: #fff;
+  padding: 8px 12px;
+}
+
+.optical-settings summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--ink);
+  padding: 6px 0;
+}
+
+.optical-settings .optical-bottom-panel {
+  margin-top: 8px;
+  border: 0;
+  padding: 0;
+  background: transparent;
 }
 
 .optical-placeholder {

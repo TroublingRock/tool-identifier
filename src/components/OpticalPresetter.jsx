@@ -7,14 +7,18 @@ import {
   saveCustomHolder,
 } from '../lib/holderPresets'
 import {
+  ARM_SETTLE_MS,
   PEAK_DROP_PX,
+  SPINDLE_SAMPLE_MS,
   applyFluteCorrection,
   analyzeSilhouetteSteps,
   avg,
   createPeakTracker,
+  createWidthSmoother,
   matchPortForm,
-  measureSilhouetteWidth,
+  measureSilhouetteDiameter,
   pixelsToInches,
+  proposeZonesFromSilhouette,
 } from '../lib/opticalMeasure'
 
 const DEFAULT_GREEN = { x: 0.22, y: 0.68, w: 0.56, h: 0.12 }
@@ -22,8 +26,20 @@ const DEFAULT_GREEN = { x: 0.22, y: 0.68, w: 0.56, h: 0.12 }
 const DEFAULT_RED = { x: 0.3, y: 0.34, w: 0.4, h: 0.12 }
 /** Pilot / minor — nearer the tip */
 const DEFAULT_BLUE = { x: 0.34, y: 0.16, w: 0.32, h: 0.12 }
-/** Functional depth line: shoulder → tip */
-const DEFAULT_YELLOW = { x: 0.5, yShoulder: 0.4, yTip: 0.12 }
+/** Functional depth line: shoulder → tip (auto-orients with horizontal mills). */
+const DEFAULT_YELLOW = {
+  orientation: 'vertical',
+  tipDir: 'up',
+  cross: 0.5,
+  shoulder: 0.4,
+  tip: 0.12,
+  x: 0.5,
+  yShoulder: 0.4,
+  yTip: 0.12,
+  xShoulder: 0.5,
+  xTip: 0.5,
+  y: 0.5,
+}
 
 const DEFAULT_HOLDER =
   BUILTIN_HOLDER_PRESETS.find((h) => h.id === 'er32') || BUILTIN_HOLDER_PRESETS[0]
@@ -52,8 +68,14 @@ export default function OpticalPresetter({
   const rafRef = useRef(0)
   const loopRunningRef = useRef(false)
   const redTrackerRef = useRef(createPeakTracker({ dropPx: PEAK_DROP_PX }))
+  const spotSmoothRef = useRef(createWidthSmoother(0.3))
+  const pilotSmoothRef = useRef(createWidthSmoother(0.3))
   const pilotPeaksRef = useRef([])
   const pilotCycleMaxRef = useRef(0)
+  const armReadyAtRef = useRef(0)
+  const spindleStartRef = useRef(0)
+  const spindleMaxSpotRef = useRef(0)
+  const spindleMaxPilotRef = useRef(0)
   const dragRef = useRef(null)
 
   const greenRef = useRef(DEFAULT_GREEN)
@@ -69,6 +91,8 @@ export default function OpticalPresetter({
   const frozenRef = useRef(false)
   const holderRef = useRef(DEFAULT_HOLDER)
   const flutesRef = useRef(3)
+  const captureModeRef = useRef('spindle')
+  const diameterAxisRef = useRef('x')
   const formSizesRef = useRef(formSizes)
   const onResultRef = useRef(onResult)
 
@@ -81,6 +105,7 @@ export default function OpticalPresetter({
   const [holderMsg, setHolderMsg] = useState('')
   const [savingHolder, setSavingHolder] = useState(false)
   const [flutes, setFlutes] = useState(3)
+  const [captureMode, setCaptureMode] = useState('spindle')
   const [armed, setArmed] = useState(false)
   const [rotations, setRotations] = useState(0)
   const [liveSpotPx, setLiveSpotPx] = useState(0)
@@ -91,9 +116,10 @@ export default function OpticalPresetter({
   const [blueZone, setBlueZone] = useState(DEFAULT_BLUE)
   const [yellowLine, setYellowLine] = useState(DEFAULT_YELLOW)
   const [detectedStepCount, setDetectedStepCount] = useState(0)
+  const [tipDirLabel, setTipDirLabel] = useState('up')
   const [result, setResult] = useState(null)
   const [status, setStatus] = useState(
-    'Green = holder. Red = spotface. Blue = pilot. Yellow = cutting depth (shoulder→tip).',
+    'Green = holder. Red = spotface. Blue = pilot. Yellow = cutting depth (shoulder→tip). Prefer spindle mode at ~500 RPM.',
   )
 
   const allHolders = useMemo(
@@ -129,6 +155,9 @@ export default function OpticalPresetter({
   useEffect(() => {
     flutesRef.current = flutes
   }, [flutes])
+  useEffect(() => {
+    captureModeRef.current = captureMode
+  }, [captureMode])
   useEffect(() => {
     formSizesRef.current = formSizes
   }, [formSizes])
@@ -196,33 +225,36 @@ export default function OpticalPresetter({
     let uiTick = 0
     loopRunningRef.current = true
 
-    const completeConsensus = (greenPixelWidth) => {
+    const completeConsensus = (greenPixelWidth, overrides = {}) => {
       frozenRef.current = true
       armedRef.current = false
       setArmed(false)
       setConsensus(true)
       stopLoop()
 
-      const spotPeaks = redTrackerRef.current.peaks.slice(0, 3)
-      const pilotPeaks = pilotPeaksRef.current.slice(0, 3)
-      while (pilotPeaks.length < spotPeaks.length) {
+      const mode = captureModeRef.current
+      const spotPeaks =
+        overrides.spotPeaks || redTrackerRef.current.peaks.slice(0, 3)
+      const pilotPeaks = overrides.pilotPeaks
+        ? [...overrides.pilotPeaks]
+        : pilotPeaksRef.current.slice(0, 3)
+      while (pilotPeaks.length < Math.max(1, spotPeaks.length)) {
         pilotPeaks.push(pilotPeaks[pilotPeaks.length - 1] || 0)
       }
 
-      const avgSpotPx = avg(spotPeaks)
-      const avgPilotPx = avg(pilotPeaks.slice(0, 3))
+      const avgSpotPx = overrides.avgSpotPx ?? avg(spotPeaks)
+      const avgPilotPx =
+        overrides.avgPilotPx ?? avg(pilotPeaks.slice(0, spotPeaks.length || 1))
       const holder = holderRef.current
-      const flutesN = flutesRef.current
+      const flutesN = mode === 'spindle' ? 0 : flutesRef.current
       const steps = stepInfoRef.current
 
-      const measuredSpot = applyFluteCorrection(
-        pixelsToInches(avgSpotPx, greenPixelWidth, holder.inches),
-        flutesN,
-      )
-      const measuredPilot = applyFluteCorrection(
-        pixelsToInches(avgPilotPx, greenPixelWidth, holder.inches),
-        flutesN,
-      )
+      const rawSpot = pixelsToInches(avgSpotPx, greenPixelWidth, holder.inches)
+      const rawPilot = pixelsToInches(avgPilotPx, greenPixelWidth, holder.inches)
+      const measuredSpot =
+        mode === 'spindle' ? rawSpot : applyFluteCorrection(rawSpot, flutesN)
+      const measuredPilot =
+        mode === 'spindle' ? rawPilot : applyFluteCorrection(rawPilot, flutesN)
       const measuredDepth = pixelsToInches(
         steps.depthPx,
         greenPixelWidth,
@@ -245,7 +277,11 @@ export default function OpticalPresetter({
       ctx.fillRect(12, canvas.height - 64, canvas.width - 24, 48)
       ctx.fillStyle = '#fff'
       ctx.font = `bold ${Math.max(16, canvas.width * 0.022)}px sans-serif`
-      ctx.fillText('3-Pass Consensus Reached', 28, canvas.height - 34)
+      ctx.fillText(
+        mode === 'spindle' ? 'Spindle Sample Complete' : '3-Pass Consensus Reached',
+        28,
+        canvas.height - 34,
+      )
       ctx.restore()
 
       video.pause()
@@ -256,8 +292,9 @@ export default function OpticalPresetter({
         holderId: holder.id,
         holderInches: holder.inches,
         flutes: flutesN,
+        captureMode: mode,
         spotPeaksPx: spotPeaks,
-        pilotPeaksPx: pilotPeaks.slice(0, 3),
+        pilotPeaksPx: pilotPeaks.slice(0, Math.max(3, spotPeaks.length)),
         avgSpotPx,
         avgPilotPx,
         measuredSpotface: measuredSpot,
@@ -274,7 +311,7 @@ export default function OpticalPresetter({
         imageDataUrl: snapshot,
       }
       setResult(payload)
-      setRotations(3)
+      setRotations(mode === 'spindle' ? 3 : spotPeaks.length)
       setDetectedStepCount(steps.detectedStepCount)
       setStatus(
         matchRow
@@ -319,43 +356,114 @@ export default function OpticalPresetter({
           Math.round(b.w),
           Math.round(b.h),
         )
-        const spotPx = measureSilhouetteWidth(redSample)
-        const pilotPx = measureSilhouetteWidth(blueSample)
+        const spotPx = measureSilhouetteDiameter(
+          redSample,
+          diameterAxisRef.current,
+        )
+        const pilotPx = measureSilhouetteDiameter(
+          blueSample,
+          diameterAxisRef.current,
+        )
+        const spotSmooth = Math.round(spotSmoothRef.current.push(spotPx))
+        const pilotSmooth = Math.round(pilotSmoothRef.current.push(pilotPx))
 
         const yLine = yellowRef.current
-        const yx = yLine.x * cw
-        const yShoulder = yLine.yShoulder * ch
-        const yTip = yLine.yTip * ch
+        const horizontal = yLine.orientation === 'horizontal'
         const frame = ctx.getImageData(0, 0, cw, ch)
-        const profile = analyzeSilhouetteSteps(frame, {
-          centerX: yx,
-          yStart: yShoulder,
-          yEnd: yTip,
-        })
+        const profile = horizontal
+          ? analyzeSilhouetteSteps(frame, {
+              orientation: 'horizontal',
+              centerY: (yLine.cross ?? yLine.y ?? 0.5) * ch,
+              xStart: (yLine.shoulder ?? yLine.xShoulder ?? 0.4) * cw,
+              xEnd: (yLine.tip ?? yLine.xTip ?? 0.12) * cw,
+            })
+          : analyzeSilhouetteSteps(frame, {
+              orientation: 'vertical',
+              centerX: (yLine.cross ?? yLine.x ?? 0.5) * cw,
+              yStart: (yLine.shoulder ?? yLine.yShoulder ?? 0.4) * ch,
+              yEnd: (yLine.tip ?? yLine.yTip ?? 0.12) * ch,
+            })
         stepInfoRef.current = profile
 
+        const yx = horizontal
+          ? (yLine.shoulder ?? yLine.xShoulder ?? 0.4) * cw
+          : (yLine.cross ?? yLine.x ?? 0.5) * cw
+        const yShoulder = horizontal
+          ? (yLine.cross ?? yLine.y ?? 0.5) * ch
+          : (yLine.shoulder ?? yLine.yShoulder ?? 0.4) * ch
+        const yTipX = horizontal
+          ? (yLine.tip ?? yLine.xTip ?? 0.12) * cw
+          : (yLine.cross ?? yLine.x ?? 0.5) * cw
+        const yTip = horizontal
+          ? (yLine.cross ?? yLine.y ?? 0.5) * ch
+          : (yLine.tip ?? yLine.yTip ?? 0.12) * ch
+        // for vertical line drawing: from (yx,yShoulder) to (yx,yTip)
+        // for horizontal: from (yx,yShoulder) to (yTipX,yTip) where yShoulder===yTip (same cross)
+
+        const now = performance.now()
+        let settleLeftMs = 0
+        let spindleProgress = 0
         if (armedRef.current) {
-          pilotCycleMaxRef.current = Math.max(
-            pilotCycleMaxRef.current,
-            pilotPx,
-          )
-          const { committedPeak } = redTrackerRef.current.push(spotPx)
-          if (committedPeak != null) {
-            pilotPeaksRef.current.push(pilotCycleMaxRef.current)
-            pilotCycleMaxRef.current = pilotPx
-            const count = redTrackerRef.current.count
-            setRotations(count)
-            if (count >= 3) {
-              completeConsensus(g.w)
-              return
+          settleLeftMs = Math.max(0, armReadyAtRef.current - now)
+          if (settleLeftMs <= 0) {
+            const mode = captureModeRef.current
+            if (mode === 'spindle') {
+              if (!spindleStartRef.current) spindleStartRef.current = now
+              spindleMaxSpotRef.current = Math.max(
+                spindleMaxSpotRef.current,
+                spotSmooth,
+              )
+              spindleMaxPilotRef.current = Math.max(
+                spindleMaxPilotRef.current,
+                pilotSmooth,
+              )
+              const elapsed = now - spindleStartRef.current
+              spindleProgress = Math.min(1, elapsed / SPINDLE_SAMPLE_MS)
+              if (uiTick % 8 === 0) {
+                setRotations(Math.min(3, Math.ceil(spindleProgress * 3)))
+              }
+              if (elapsed >= SPINDLE_SAMPLE_MS) {
+                const maxSpot = spindleMaxSpotRef.current
+                const maxPilot = spindleMaxPilotRef.current
+                completeConsensus(g.w, {
+                  spotPeaks: [maxSpot, maxSpot, maxSpot],
+                  pilotPeaks: [maxPilot, maxPilot, maxPilot],
+                  avgSpotPx: maxSpot,
+                  avgPilotPx: maxPilot,
+                })
+                return
+              }
+            } else {
+              pilotCycleMaxRef.current = Math.max(
+                pilotCycleMaxRef.current,
+                pilotSmooth,
+              )
+              const { committedPeak } = redTrackerRef.current.push(
+                spotSmooth,
+                now,
+              )
+              if (committedPeak != null) {
+                pilotPeaksRef.current.push(pilotCycleMaxRef.current)
+                pilotCycleMaxRef.current = pilotSmooth
+                const count = redTrackerRef.current.count
+                setRotations(count)
+                if (count >= 3) {
+                  completeConsensus(g.w)
+                  return
+                }
+              }
             }
+          } else if (uiTick % 10 === 0) {
+            setStatus(
+              `Hold steady — starting in ${(settleLeftMs / 1000).toFixed(1)}s…`,
+            )
           }
         }
 
         uiTick += 1
         if (uiTick % 4 === 0) {
-          setLiveSpotPx(spotPx)
-          setLivePilotPx(pilotPx)
+          setLiveSpotPx(spotSmooth)
+          setLivePilotPx(pilotSmooth)
         }
         if (uiTick % 8 === 0) setDetectedStepCount(profile.detectedStepCount)
 
@@ -396,23 +504,59 @@ export default function OpticalPresetter({
         ctx.fillStyle = 'rgba(234, 179, 8, 0.95)'
         ctx.lineWidth = Math.max(3, cw * 0.004)
         ctx.beginPath()
-        ctx.moveTo(yx, yShoulder)
-        ctx.lineTo(yx, yTip)
+        if (horizontal) {
+          ctx.moveTo(yx, yShoulder)
+          ctx.lineTo(yTipX, yTip)
+        } else {
+          ctx.moveTo(yx, yShoulder)
+          ctx.lineTo(yx, yTip)
+        }
         ctx.stroke()
         const handle = Math.max(8, cw * 0.01)
-        ctx.fillRect(yx - handle, yShoulder - handle, handle * 2, handle * 2)
-        ctx.fillRect(yx - handle, yTip - handle, handle * 2, handle * 2)
-        ctx.fillText('DEPTH', yx + handle + 4, (yShoulder + yTip) / 2)
+        if (horizontal) {
+          ctx.fillRect(yx - handle, yShoulder - handle, handle * 2, handle * 2)
+          ctx.fillRect(yTipX - handle, yTip - handle, handle * 2, handle * 2)
+          ctx.fillText(
+            'DEPTH',
+            (yx + yTipX) / 2,
+            yShoulder - handle - 4,
+          )
+        } else {
+          ctx.fillRect(yx - handle, yShoulder - handle, handle * 2, handle * 2)
+          ctx.fillRect(yx - handle, yTip - handle, handle * 2, handle * 2)
+          ctx.fillText('DEPTH', yx + handle + 4, (yShoulder + yTip) / 2)
+        }
 
         ctx.fillStyle = 'rgba(15, 23, 42, 0.78)'
         ctx.fillRect(12, 12, Math.min(460, cw * 0.62), 88)
         ctx.fillStyle = '#f8fafc'
-        ctx.fillText(`Spotface: ${spotPx}px · Pilot: ${pilotPx}px`, 24, 34)
         ctx.fillText(
-          `Rotations Tracked: ${redTrackerRef.current.count}/3`,
+          `Spotface: ${spotSmooth}px · Pilot: ${pilotSmooth}px`,
           24,
-          56,
+          34,
         )
+        if (armedRef.current && settleLeftMs > 0) {
+          ctx.fillText(
+            `Settle ${(settleLeftMs / 1000).toFixed(1)}s — start spindle / hold still`,
+            24,
+            56,
+          )
+        } else if (
+          armedRef.current &&
+          captureModeRef.current === 'spindle'
+        ) {
+          ctx.fillText(
+            `Spindle sample ${Math.round(spindleProgress * 100)}% (max envelope)`,
+            24,
+            56,
+          )
+        } else {
+          ctx.fillText(
+            `Rotations Tracked: ${redTrackerRef.current.count}/3`,
+            24,
+            56,
+          )
+        }
         ctx.fillText(
           `Steps detected: ${profile.detectedStepCount} · lands ${profile.landCount}`,
           24,
@@ -446,8 +590,14 @@ export default function OpticalPresetter({
     setRotations(0)
     frozenRef.current = false
     redTrackerRef.current.reset()
+    spotSmoothRef.current.reset()
+    pilotSmoothRef.current.reset()
     pilotPeaksRef.current = []
     pilotCycleMaxRef.current = 0
+    armReadyAtRef.current = 0
+    spindleStartRef.current = 0
+    spindleMaxSpotRef.current = 0
+    spindleMaxPilotRef.current = 0
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
@@ -482,11 +632,52 @@ export default function OpticalPresetter({
     frozenRef.current = false
   }
 
+  function autoPlaceZones() {
+    if (!cameraOn || frozenRef.current) return
+    const canvas = canvasRef.current
+    const video = videoRef.current
+    if (!canvas || !video || video.readyState < 2) {
+      setStatus('Start the camera first, then align the green box on the collet nut.')
+      return
+    }
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })
+    if (
+      canvas.width !== video.videoWidth ||
+      canvas.height !== video.videoHeight
+    ) {
+      canvas.width = video.videoWidth || 1280
+      canvas.height = video.videoHeight || 720
+    }
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+    const frame = ctx.getImageData(0, 0, canvas.width, canvas.height)
+    const proposal = proposeZonesFromSilhouette(frame, greenRef.current)
+    if (!proposal) {
+      setStatus(
+        'Could not see a clear tool silhouette from the green box. Check backlight and collet alignment.',
+      )
+      return
+    }
+    setRedZone(proposal.red)
+    setBlueZone(proposal.blue)
+    setYellowLine(proposal.yellow)
+    diameterAxisRef.current = proposal.diameterAxis || 'x'
+    setTipDirLabel(proposal.tipDir || 'up')
+    setStatus(
+      `Auto-placed for tip-${proposal.tipDir} (${proposal.orientation}). Nudge if needed, then Arm.`,
+    )
+  }
+
   function armCapture() {
     if (!cameraOn) return
     redTrackerRef.current.reset()
+    spotSmoothRef.current.reset()
+    pilotSmoothRef.current.reset()
     pilotPeaksRef.current = []
     pilotCycleMaxRef.current = 0
+    spindleStartRef.current = 0
+    spindleMaxSpotRef.current = 0
+    spindleMaxPilotRef.current = 0
+    armReadyAtRef.current = performance.now() + ARM_SETTLE_MS
     setRotations(0)
     setResult(null)
     setConsensus(false)
@@ -494,14 +685,24 @@ export default function OpticalPresetter({
     videoRef.current?.play()
     armedRef.current = true
     setArmed(true)
-    setStatus('Armed — spin slowly. Tracking spotface + pilot peaks…')
+    setStatus(
+      captureMode === 'spindle'
+        ? 'Armed — start spindle (~500 RPM). 1.5s settle, then 2.5s max-diameter sample (no flute math).'
+        : 'Armed — wait for settle, then spin slowly by hand. False peaks from shake are filtered.',
+    )
     if (!loopRunningRef.current) startLoop()
   }
 
   function resetMeasurement() {
     redTrackerRef.current.reset()
+    spotSmoothRef.current.reset()
+    pilotSmoothRef.current.reset()
     pilotPeaksRef.current = []
     pilotCycleMaxRef.current = 0
+    spindleStartRef.current = 0
+    spindleMaxSpotRef.current = 0
+    spindleMaxPilotRef.current = 0
+    armReadyAtRef.current = 0
     setArmed(false)
     armedRef.current = false
     setRotations(0)
@@ -522,19 +723,43 @@ export default function OpticalPresetter({
   function hitTest(nx, ny) {
     const y = yellowRef.current
     const pad = 0.03
-    const nearLine = Math.abs(nx - y.x) < pad
-    if (nearLine && Math.abs(ny - y.yShoulder) < pad) {
-      return { target: 'yellow', mode: 'yellow-shoulder' }
-    }
-    if (nearLine && Math.abs(ny - y.yTip) < pad) {
-      return { target: 'yellow', mode: 'yellow-tip' }
-    }
-    if (
-      nearLine &&
-      ny >= Math.min(y.yShoulder, y.yTip) - pad &&
-      ny <= Math.max(y.yShoulder, y.yTip) + pad
-    ) {
-      return { target: 'yellow', mode: 'yellow-move' }
+    const horizontal = y.orientation === 'horizontal'
+    if (horizontal) {
+      const cross = y.cross ?? y.y ?? 0.5
+      const shoulder = y.shoulder ?? y.xShoulder ?? 0.4
+      const tip = y.tip ?? y.xTip ?? 0.12
+      const nearLine = Math.abs(ny - cross) < pad
+      if (nearLine && Math.abs(nx - shoulder) < pad) {
+        return { target: 'yellow', mode: 'yellow-shoulder' }
+      }
+      if (nearLine && Math.abs(nx - tip) < pad) {
+        return { target: 'yellow', mode: 'yellow-tip' }
+      }
+      if (
+        nearLine &&
+        nx >= Math.min(shoulder, tip) - pad &&
+        nx <= Math.max(shoulder, tip) + pad
+      ) {
+        return { target: 'yellow', mode: 'yellow-move' }
+      }
+    } else {
+      const cross = y.cross ?? y.x ?? 0.5
+      const shoulder = y.shoulder ?? y.yShoulder ?? 0.4
+      const tip = y.tip ?? y.yTip ?? 0.12
+      const nearLine = Math.abs(nx - cross) < pad
+      if (nearLine && Math.abs(ny - shoulder) < pad) {
+        return { target: 'yellow', mode: 'yellow-shoulder' }
+      }
+      if (nearLine && Math.abs(ny - tip) < pad) {
+        return { target: 'yellow', mode: 'yellow-tip' }
+      }
+      if (
+        nearLine &&
+        ny >= Math.min(shoulder, tip) - pad &&
+        ny <= Math.max(shoulder, tip) + pad
+      ) {
+        return { target: 'yellow', mode: 'yellow-move' }
+      }
     }
 
     const boxes = [
@@ -596,21 +821,72 @@ export default function OpticalPresetter({
 
     if (drag.target === 'yellow') {
       const src = drag.yellow
-      if (drag.mode === 'yellow-shoulder') {
+      const horizontal = src.orientation === 'horizontal'
+      if (horizontal) {
+        if (drag.mode === 'yellow-shoulder') {
+          const shoulder = clamp(nx, 0.04, 0.96)
+          setYellowLine({
+            ...src,
+            shoulder,
+            xShoulder: shoulder,
+          })
+        } else if (drag.mode === 'yellow-tip') {
+          const tip = clamp(nx, 0.04, 0.96)
+          setYellowLine({
+            ...src,
+            tip,
+            xTip: tip,
+          })
+        } else {
+          const span = (src.tip ?? src.xTip) - (src.shoulder ?? src.xShoulder)
+          const nextShoulder = clamp(
+            (src.shoulder ?? src.xShoulder) + dx,
+            0.04,
+            0.96,
+          )
+          const cross = clamp((src.cross ?? src.y) + dy, 0.04, 0.96)
+          setYellowLine({
+            ...src,
+            cross,
+            y: cross,
+            yShoulder: cross,
+            yTip: cross,
+            shoulder: nextShoulder,
+            tip: clamp(nextShoulder + span, 0.04, 0.96),
+            xShoulder: nextShoulder,
+            xTip: clamp(nextShoulder + span, 0.04, 0.96),
+          })
+        }
+      } else if (drag.mode === 'yellow-shoulder') {
+        const shoulder = clamp(ny, 0.04, 0.96)
         setYellowLine({
           ...src,
-          yShoulder: clamp(ny, 0.04, 0.96),
+          shoulder,
+          yShoulder: shoulder,
         })
       } else if (drag.mode === 'yellow-tip') {
+        const tip = clamp(ny, 0.04, 0.96)
         setYellowLine({
           ...src,
-          yTip: clamp(ny, 0.04, 0.96),
+          tip,
+          yTip: tip,
         })
       } else {
-        const span = src.yTip - src.yShoulder
-        const nextShoulder = clamp(src.yShoulder + dy, 0.04, 0.96)
+        const span = (src.tip ?? src.yTip) - (src.shoulder ?? src.yShoulder)
+        const nextShoulder = clamp(
+          (src.shoulder ?? src.yShoulder) + dy,
+          0.04,
+          0.96,
+        )
+        const cross = clamp((src.cross ?? src.x) + dx, 0.04, 0.96)
         setYellowLine({
-          x: clamp(src.x + dx, 0.04, 0.96),
+          ...src,
+          cross,
+          x: cross,
+          xShoulder: cross,
+          xTip: cross,
+          shoulder: nextShoulder,
+          tip: clamp(nextShoulder + span, 0.04, 0.96),
           yShoulder: nextShoulder,
           yTip: clamp(nextShoulder + span, 0.04, 0.96),
         })
@@ -648,11 +924,16 @@ export default function OpticalPresetter({
   }
 
   function onPointerUp(event) {
+    const drag = dragRef.current
     dragRef.current = null
     try {
       event.currentTarget.releasePointerCapture(event.pointerId)
     } catch {
       /* ignore */
+    }
+    if (drag?.target === 'green' && cameraOn && !frozenRef.current) {
+      // Collet box moved — re-find tip / spotface relative to the new holder.
+      window.setTimeout(() => autoPlaceZones(), 40)
     }
   }
 
@@ -664,10 +945,9 @@ export default function OpticalPresetter({
       <div className="section-copy">
         <h2 id="optical-heading">Port Form Classifier</h2>
         <p>
-          Dual-diameter Point–Spin–Match with step profile scanning: green
-          holder reference, red spotface/major, blue pilot/minor, yellow
-          functional depth. Multi-step tools route to cartridge cavity classes
-          (C08–C16).
+        Dual-diameter Point–Spin–Match: line up the green box on your collet
+        nut OD, tap Auto-place zones, then Arm. Prefer spindle mode so the phone
+        stays still while the tool turns.
         </p>
       </div>
 
@@ -707,7 +987,70 @@ export default function OpticalPresetter({
         ) : null}
       </div>
 
-      <div className="optical-bottom-panel">
+      <div className="optical-dock" aria-label="Capture controls">
+        <div className="optical-dock-row">
+          <button
+            type="button"
+            className="btn ghost"
+            disabled={!cameraOn || consensus || saving}
+            onClick={autoPlaceZones}
+          >
+            Auto-place
+          </button>
+          <button
+            type="button"
+            className="btn primary arm-btn"
+            disabled={
+              !cameraOn || consensus || saving || holderId === CUSTOM_OPTION_ID
+            }
+            onClick={armCapture}
+          >
+            Arm Auto-Capture
+          </button>
+        </div>
+        <div className="flute-group optical-dock-modes" role="group" aria-label="Capture mode">
+          <button
+            type="button"
+            className={`btn ${captureMode === 'spindle' ? 'primary' : 'ghost'}`}
+            onClick={() => setCaptureMode('spindle')}
+          >
+            Spindle
+          </button>
+          <button
+            type="button"
+            className={`btn ${captureMode === 'hand' ? 'primary' : 'ghost'}`}
+            onClick={() => setCaptureMode('hand')}
+          >
+            Hand
+          </button>
+          {captureMode === 'hand'
+            ? [2, 3, 4].map((n) => (
+                <button
+                  key={n}
+                  type="button"
+                  className={`btn ${flutes === n ? 'primary' : 'ghost'}`}
+                  onClick={() => setFlutes(n)}
+                >
+                  {n}fl
+                </button>
+              ))
+            : null}
+        </div>
+        <p className="rotation-progress optical-dock-progress" aria-live="polite">
+          {tipDirLabel ? `tip-${tipDirLabel} · ` : ''}
+          {captureMode === 'spindle'
+            ? `Sample ${rotations}/3`
+            : `Rots ${rotations}/3`}
+          {armed ? ' · ARMED' : ''}
+          {liveSpotPx || livePilotPx
+            ? ` · ${liveSpotPx}/${livePilotPx}px`
+            : ''}
+        </p>
+      </div>
+
+      <details className="optical-settings">
+        <summary>Holder &amp; options</summary>
+        <div className="optical-bottom-panel">
         <label className="field">
           <span>Holder selector</span>
           <select
@@ -737,19 +1080,16 @@ export default function OpticalPresetter({
           </select>
         </label>
 
-        <div className="flute-group" role="group" aria-label="Flute count">
-          <span>Flutes:</span>
-          {[2, 3, 4].map((n) => (
-            <button
-              key={n}
-              type="button"
-              className={`btn ${flutes === n ? 'primary' : 'ghost'}`}
-              onClick={() => setFlutes(n)}
-            >
-              {n}
-            </button>
-          ))}
-        </div>
+        {captureMode === 'spindle' ? (
+          <p className="empty-hint">
+            Spindle mode: 1.5s settle + 2.5s max-diameter sample. No flute math.
+            Phone sideways is fine — Auto-place detects tip left/right/up/down.
+          </p>
+        ) : (
+          <p className="empty-hint">
+            Hand mode uses fretting filters. Prefer spindle if the phone shakes.
+          </p>
+        )}
 
         {holderId === CUSTOM_OPTION_ID ||
         customHolders.some((h) => h.id === holderId) ? (
@@ -798,29 +1138,8 @@ export default function OpticalPresetter({
             {holderMsg ? <p className="status">{holderMsg}</p> : null}
           </div>
         ) : null}
-
-        <button
-          type="button"
-          className="btn primary arm-btn"
-          disabled={
-            !cameraOn || consensus || saving || holderId === CUSTOM_OPTION_ID
-          }
-          onClick={armCapture}
-        >
-          Arm Auto-Capture
-        </button>
-
-        <p className="rotation-progress" aria-live="polite">
-          Rotations Tracked: {rotations}/3
-          {armed ? ' · ARMED' : ''}
-          {liveSpotPx || livePilotPx
-            ? ` · spot ${liveSpotPx}px / pilot ${livePilotPx}px`
-            : ''}
-          {detectedStepCount
-            ? ` · steps ${detectedStepCount}`
-            : ''}
-        </p>
-      </div>
+        </div>
+      </details>
 
       {result ? (
         <article className="optical-result">

@@ -1,7 +1,16 @@
 /** Re-export builtins for callers that historically imported HOLDER_PRESETS. */
 export { BUILTIN_HOLDER_PRESETS as HOLDER_PRESETS } from './holderPresets'
 
-export const PEAK_DROP_PX = 3
+/** Minimum drop from local max before a peak counts (filters camera/hand jitter). */
+export const PEAK_DROP_PX = 10
+/** Minimum rise from trough before entering climb. */
+export const MIN_RISE_PX = 6
+/** Ignore new peaks closer than this (hand wobble makes fast false cycles). */
+export const MIN_PEAK_INTERVAL_MS = 500
+/** Spindle mode: collect max silhouette width for this long after arm delay. */
+export const SPINDLE_SAMPLE_MS = 2500
+/** Settle time after Arm before peaks/samples count. */
+export const ARM_SETTLE_MS = 1500
 export const MATCH_TOLERANCE_IN = 0.03
 export const SPOTFACE_TOLERANCE_IN = 0.03
 export const PILOT_TOLERANCE_IN = 0.02
@@ -131,15 +140,20 @@ export function matchPortForm({
 }
 
 /**
- * Scan a vertical band and count distinct diameter lands/steps.
- * Scan from holder face toward tip (yStart → yEnd).
+ * Scan along the tool axis and count distinct diameter lands/steps.
+ * orientation 'vertical': tip up/down (scan Y, diameter along X).
+ * orientation 'horizontal': tip left/right (scan X, diameter along Y).
  */
 export function analyzeSilhouetteSteps(
   imageData,
   {
+    orientation = 'vertical',
     centerX,
+    centerY,
     yStart,
     yEnd,
+    xStart,
+    xEnd,
     bandHalfWidth = 140,
     threshold = 95,
     minLandRows = 4,
@@ -147,25 +161,52 @@ export function analyzeSilhouetteSteps(
   } = {},
 ) {
   const { data, width, height } = imageData
-  const top = Math.max(0, Math.round(Math.min(yStart, yEnd)))
-  const bottom = Math.min(height - 1, Math.round(Math.max(yStart, yEnd)))
-  const x0 = Math.max(0, Math.round(centerX - bandHalfWidth))
-  const x1 = Math.min(width - 1, Math.round(centerX + bandHalfWidth))
 
   const widths = []
-  for (let y = top; y <= bottom; y += 1) {
-    let left = -1
-    let right = -1
-    for (let x = x0; x <= x1; x += 1) {
-      const i = (y * width + x) * 4
-      const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]
-      if (lum < threshold) {
-        if (left < 0) left = x
-        right = x
+  let depthPx = 0
+
+  if (orientation === 'horizontal') {
+    const left = Math.max(0, Math.round(Math.min(xStart, xEnd)))
+    const right = Math.min(width - 1, Math.round(Math.max(xStart, xEnd)))
+    const cy = Math.round(centerY ?? height / 2)
+    const y0 = Math.max(0, cy - bandHalfWidth)
+    const y1 = Math.min(height - 1, cy + bandHalfWidth)
+    depthPx = Math.max(0, right - left)
+    for (let x = left; x <= right; x += 1) {
+      let top = -1
+      let bottom = -1
+      for (let y = y0; y <= y1; y += 1) {
+        const i = (y * width + x) * 4
+        const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]
+        if (lum < threshold) {
+          if (top < 0) top = y
+          bottom = y
+        }
       }
+      const span = top >= 0 ? bottom - top + 1 : 0
+      if (span >= 4) widths.push(span)
     }
-    const span = left >= 0 ? right - left + 1 : 0
-    if (span >= 4) widths.push(span)
+  } else {
+    const top = Math.max(0, Math.round(Math.min(yStart, yEnd)))
+    const bottom = Math.min(height - 1, Math.round(Math.max(yStart, yEnd)))
+    const cx = Math.round(centerX ?? width / 2)
+    const x0 = Math.max(0, cx - bandHalfWidth)
+    const x1 = Math.min(width - 1, cx + bandHalfWidth)
+    depthPx = Math.max(0, bottom - top)
+    for (let y = top; y <= bottom; y += 1) {
+      let left = -1
+      let right = -1
+      for (let x = x0; x <= x1; x += 1) {
+        const i = (y * width + x) * 4
+        const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]
+        if (lum < threshold) {
+          if (left < 0) left = x
+          right = x
+        }
+      }
+      const span = left >= 0 ? right - left + 1 : 0
+      if (span >= 4) widths.push(span)
+    }
   }
 
   if (widths.length < minLandRows * 2) {
@@ -175,7 +216,7 @@ export function analyzeSilhouetteSteps(
       lands: [],
       maxWidthPx: 0,
       minWidthPx: 0,
-      depthPx: Math.max(0, bottom - top),
+      depthPx,
     }
   }
 
@@ -250,48 +291,350 @@ export function analyzeSilhouetteSteps(
     lands: merged,
     maxWidthPx,
     minWidthPx,
-    depthPx: Math.max(0, bottom - top),
+    depthPx,
   }
 }
 
 /**
- * Dark silhouette horizontal width (px) inside an ImageData region.
+ * Measure tool diameter inside a crop: span across the tool (perpendicular to tip).
+ * acrossAxis 'x' = tip up/down (horizontal pixel width).
+ * acrossAxis 'y' = tip left/right (vertical pixel height).
  */
-export function measureSilhouetteWidth(imageData, threshold = 95) {
+export function measureSilhouetteDiameter(imageData, acrossAxis = 'x', threshold = 95) {
   const { data, width, height } = imageData
   let maxSpan = 0
 
-  for (let y = 0; y < height; y += 1) {
-    let left = -1
-    let right = -1
-    for (let x = 0; x < width; x += 1) {
+  if (acrossAxis === 'x') {
+    for (let y = 0; y < height; y += 1) {
+      let left = -1
+      let right = -1
+      for (let x = 0; x < width; x += 1) {
+        const i = (y * width + x) * 4
+        const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]
+        if (lum < threshold) {
+          if (left < 0) left = x
+          right = x
+        }
+      }
+      if (left >= 0) maxSpan = Math.max(maxSpan, right - left + 1)
+    }
+    return maxSpan
+  }
+
+  for (let x = 0; x < width; x += 1) {
+    let top = -1
+    let bottom = -1
+    for (let y = 0; y < height; y += 1) {
       const i = (y * width + x) * 4
       const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]
       if (lum < threshold) {
-        if (left < 0) left = x
-        right = x
+        if (top < 0) top = y
+        bottom = y
       }
     }
-    if (left >= 0 && right >= left) {
-      maxSpan = Math.max(maxSpan, right - left + 1)
-    }
+    if (top >= 0) maxSpan = Math.max(maxSpan, bottom - top + 1)
   }
-
   return maxSpan
 }
 
+/** @deprecated prefer measureSilhouetteDiameter */
+export function measureSilhouetteWidth(imageData, threshold = 95) {
+  return measureSilhouetteDiameter(imageData, 'x', threshold)
+}
+
+function clamp01(n) {
+  return Math.min(0.96, Math.max(0.02, n))
+}
+
+function sampleSpanAt(
+  data,
+  cw,
+  ch,
+  alongPos,
+  crossCenter,
+  tipDir,
+  bandHalf,
+  threshold,
+) {
+  let a0 = -1
+  let a1 = -1
+  if (tipDir === 'up' || tipDir === 'down') {
+    const y = Math.round(alongPos)
+    const x0 = Math.max(0, Math.round(crossCenter - bandHalf))
+    const x1 = Math.min(cw - 1, Math.round(crossCenter + bandHalf))
+    if (y < 0 || y >= ch) return null
+    for (let x = x0; x <= x1; x += 1) {
+      const i = (y * cw + x) * 4
+      const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]
+      if (lum < threshold) {
+        if (a0 < 0) a0 = x
+        a1 = x
+      }
+    }
+  } else {
+    const x = Math.round(alongPos)
+    const y0 = Math.max(0, Math.round(crossCenter - bandHalf))
+    const y1 = Math.min(ch - 1, Math.round(crossCenter + bandHalf))
+    if (x < 0 || x >= cw) return null
+    for (let y = y0; y <= y1; y += 1) {
+      const i = (y * cw + x) * 4
+      const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]
+      if (lum < threshold) {
+        if (a0 < 0) a0 = y
+        a1 = y
+      }
+    }
+  }
+  if (a0 < 0) return null
+  return { span: a1 - a0 + 1, mid: (a0 + a1) / 2, a0, a1 }
+}
+
 /**
- * Best-of-N rotation peak tracker.
+ * Detect which way the tool sticks out from the green collet box, then place
+ * red/blue/yellow overlays along that axis (vertical or horizontal mills).
+ */
+export function proposeZonesFromSilhouette(
+  imageData,
+  greenBoxNorm,
+  {
+    threshold = 95,
+    tipDir: forcedTipDir = null,
+    bandHalfWidth = 180,
+    minSpanPx = 8,
+  } = {},
+) {
+  const { data, width: cw, height: ch } = imageData
+  if (!cw || !ch) return null
+
+  const gx = greenBoxNorm.x * cw
+  const gy = greenBoxNorm.y * ch
+  const gw = Math.max(1, greenBoxNorm.w * cw)
+  const gh = Math.max(1, greenBoxNorm.h * ch)
+  const cx = gx + gw / 2
+  const cy = gy + gh / 2
+
+  const candidates = forcedTipDir
+    ? [forcedTipDir]
+    : ['up', 'down', 'left', 'right']
+
+  let best = null
+  for (const tipDir of candidates) {
+    const horizontal = tipDir === 'left' || tipDir === 'right'
+    const crossCenter = horizontal ? cy : cx
+    let start
+    let limit
+    let step
+    if (tipDir === 'up') {
+      start = gy
+      limit = Math.round(ch * 0.02)
+      step = -1
+    } else if (tipDir === 'down') {
+      start = gy + gh
+      limit = Math.round(ch * 0.98)
+      step = 1
+    } else if (tipDir === 'left') {
+      start = gx
+      limit = Math.round(cw * 0.02)
+      step = -1
+    } else {
+      start = gx + gw
+      limit = Math.round(cw * 0.98)
+      step = 1
+    }
+
+    const rows = []
+    for (
+      let along = Math.round(start) + step;
+      step < 0 ? along >= limit : along <= limit;
+      along += step
+    ) {
+      const hit = sampleSpanAt(
+        data,
+        cw,
+        ch,
+        along,
+        crossCenter,
+        tipDir,
+        bandHalfWidth,
+        threshold,
+      )
+      if (hit && hit.span >= minSpanPx) {
+        rows.push({ along, ...hit })
+      } else if (rows.length > 8) {
+        let empty = 0
+        let peek = along + step
+        while (empty < 6 && (step < 0 ? peek >= limit : peek <= limit)) {
+          const again = sampleSpanAt(
+            data,
+            cw,
+            ch,
+            peek,
+            crossCenter,
+            tipDir,
+            bandHalfWidth,
+            threshold,
+          )
+          if (again && again.span >= minSpanPx) {
+            rows.push({ along: peek, ...again })
+            along = peek
+            break
+          }
+          empty += 1
+          peek += step
+        }
+        if (empty >= 6) break
+      }
+    }
+
+    if (rows.length < 12) continue
+    const score =
+      rows.length *
+      (1 + rows.reduce((s, r) => s + r.span, 0) / rows.length / 100)
+    if (!best || score > best.score) {
+      best = { tipDir, horizontal, rows, score, crossCenter }
+    }
+  }
+
+  if (!best) return null
+
+  const { tipDir, horizontal, rows } = best
+  const smooth = rows.map((row, i) => {
+    const a = rows[Math.max(0, i - 2)].span
+    const b = rows[Math.max(0, i - 1)].span
+    const c = row.span
+    const d = rows[Math.min(rows.length - 1, i + 1)].span
+    const e = rows[Math.min(rows.length - 1, i + 2)].span
+    return (a + b + c + d + e) / 5
+  })
+
+  let maxIdx = 0
+  for (let i = 1; i < smooth.length; i += 1) {
+    if (smooth[i] > smooth[maxIdx]) maxIdx = i
+  }
+  const tipBand = Math.max(6, Math.floor(rows.length * 0.12))
+  let majorIdx = maxIdx
+  if (maxIdx < tipBand) {
+    let bestIdx = tipBand
+    for (let i = tipBand; i < smooth.length; i += 1) {
+      if (smooth[i] >= smooth[bestIdx]) bestIdx = i
+    }
+    majorIdx = bestIdx
+  }
+
+  const tipSlice = smooth.slice(0, Math.max(tipBand, 4))
+  const tipWidth =
+    tipSlice.reduce((s, v) => s + v, 0) / Math.max(1, tipSlice.length)
+  const major = rows[majorIdx]
+  const tip = rows[0]
+  const axisMid =
+    rows.reduce((s, r) => s + r.mid, 0) / rows.length || best.crossCenter
+
+  const orientation = horizontal ? 'horizontal' : 'vertical'
+  const acrossPx = smooth[majorIdx]
+  const alongNorm = (v) => (horizontal ? v / cw : v / ch)
+  const crossNorm = axisMid / (horizontal ? ch : cw)
+
+  const boxAlong = Math.max(
+    0.06,
+    Math.min(0.11, (acrossPx * 0.35) / (horizontal ? cw : ch)),
+  )
+  const boxAcross = Math.min(
+    0.72,
+    Math.max(0.16, (acrossPx * 1.28) / (horizontal ? ch : cw)),
+  )
+  const tipAcross = Math.min(
+    0.55,
+    Math.max(0.12, (tipWidth * 1.35) / (horizontal ? ch : cw)),
+  )
+
+  let red
+  let blue
+  if (horizontal) {
+    const redX = clamp01(alongNorm(major.along) - boxAlong / 2)
+    const blueX = clamp01(alongNorm(tip.along) - boxAlong / 2)
+    const redY = clamp01(crossNorm - boxAcross / 2)
+    const blueY = clamp01(crossNorm - tipAcross / 2)
+    red = {
+      x: redX,
+      y: redY,
+      w: Math.min(boxAlong, 0.96 - redX),
+      h: Math.min(boxAcross, 0.96 - redY),
+    }
+    blue = {
+      x: blueX,
+      y: blueY,
+      w: Math.min(boxAlong * 0.95, 0.96 - blueX),
+      h: Math.min(tipAcross, 0.96 - blueY),
+    }
+  } else {
+    const redY = clamp01(alongNorm(major.along) - boxAlong / 2)
+    const blueY = clamp01(alongNorm(tip.along) - boxAlong / 2)
+    const redX = clamp01(crossNorm - boxAcross / 2)
+    const blueX = clamp01(crossNorm - tipAcross / 2)
+    red = {
+      x: redX,
+      y: redY,
+      w: Math.min(boxAcross, 0.96 - redX),
+      h: Math.min(boxAlong, 0.96 - redY),
+    }
+    blue = {
+      x: blueX,
+      y: blueY,
+      w: Math.min(tipAcross, 0.96 - blueX),
+      h: Math.min(boxAlong * 0.9, 0.96 - blueY),
+    }
+  }
+
+  const yellow = {
+    orientation,
+    tipDir,
+    cross: clamp01(crossNorm),
+    shoulder: clamp01(alongNorm(major.along)),
+    tip: clamp01(alongNorm(tip.along)),
+    x: clamp01(crossNorm),
+    y: clamp01(crossNorm),
+    yShoulder: horizontal
+      ? clamp01(crossNorm)
+      : clamp01(alongNorm(major.along)),
+    yTip: horizontal ? clamp01(crossNorm) : clamp01(alongNorm(tip.along)),
+    xShoulder: horizontal
+      ? clamp01(alongNorm(major.along))
+      : clamp01(crossNorm),
+    xTip: horizontal ? clamp01(alongNorm(tip.along)) : clamp01(crossNorm),
+  }
+
+  return {
+    red,
+    blue,
+    yellow,
+    tipDir,
+    orientation,
+    diameterAxis: horizontal ? 'y' : 'x',
+    meta: {
+      rowCount: rows.length,
+      majorWidthPx: smooth[majorIdx],
+      tipWidthPx: tipWidth,
+      tipDir,
+      orientation,
+    },
+  }
+}
+
+/**
+ * Best-of-N rotation peak tracker (hand-spin).
+ * Stricter drop/rise + min interval reject shaky false rotations.
  */
 export function createPeakTracker({
   dropPx = PEAK_DROP_PX,
-  minPeakPx = 8,
-  minRisePx = 2,
+  minPeakPx = 12,
+  minRisePx = MIN_RISE_PX,
+  minIntervalMs = MIN_PEAK_INTERVAL_MS,
 } = {}) {
   let peak = 0
   let trough = Infinity
   /** @type {'seek'|'climb'|'fall'} */
   let phase = 'seek'
+  let lastCommitAt = 0
   const peaks = []
 
   return {
@@ -299,6 +642,7 @@ export function createPeakTracker({
       peak = 0
       trough = Infinity
       phase = 'seek'
+      lastCommitAt = 0
       peaks.length = 0
     },
     get peaks() {
@@ -310,7 +654,7 @@ export function createPeakTracker({
     get currentPeak() {
       return peak
     },
-    push(widthPx) {
+    push(widthPx, nowMs = performance.now()) {
       if (phase === 'seek') {
         trough = Math.min(trough, widthPx)
         if (widthPx >= trough + minRisePx) {
@@ -326,8 +670,14 @@ export function createPeakTracker({
           return { committedPeak: null, peak, phase }
         }
         if (peak >= minPeakPx && widthPx <= peak - dropPx) {
+          const okInterval =
+            !lastCommitAt || nowMs - lastCommitAt >= minIntervalMs
           phase = 'fall'
           trough = widthPx
+          if (!okInterval) {
+            return { committedPeak: null, peak, phase }
+          }
+          lastCommitAt = nowMs
           const committedPeak = peak
           peaks.push(committedPeak)
           return { committedPeak, peak, phase }
@@ -341,6 +691,24 @@ export function createPeakTracker({
         peak = widthPx
       }
       return { committedPeak: null, peak, phase }
+    },
+  }
+}
+
+/** Simple EMA to calm silhouette width jitter before peak detection. */
+export function createWidthSmoother(alpha = 0.35) {
+  let value = null
+  return {
+    reset() {
+      value = null
+    },
+    push(raw) {
+      if (value == null) value = raw
+      else value = alpha * raw + (1 - alpha) * value
+      return value
+    },
+    get value() {
+      return value
     },
   }
 }
