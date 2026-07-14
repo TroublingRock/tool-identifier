@@ -667,7 +667,7 @@ export default function OpticalPresetter({
           Dual-diameter Point–Spin–Match with step profile scanning: green
           holder reference, red spotface/major, blue pilot/minor, yellow
           functional depth. Multi-step tools route to cartridge cavity classes
-          (C08–C16) in <code>port_calculator</code>.
+          (C08–C16).
         </p>
       </div>
 
@@ -917,8 +917,8 @@ export default function OpticalPresetter({
             </div>
           ) : (
             <p className="empty-hint">
-              No form-size rows available. Seed{' '}
-              <code>port_form_sizes</code> or import charts.
+              No form sizes on file yet. Add them under Shop form sizes, or
+              import a chart photo.
             </p>
           )}
         </article>

@@ -222,9 +222,9 @@ export default function StandardsImporter({
       <div className="section-copy">
         <h2 id="import-heading">Add standards from PDF or camera</h2>
         <p>
-          Upload a catalog chart PDF or photograph a page. Detected standards are
-          reviewed here, saved into <code>port_calculator.port_standards</code>,
-          and appear in the dropdown — no SQL Editor.
+          Upload a catalog chart PDF or photograph a page. Detected standards
+          are reviewed here, then saved to your standards list for optical
+          matching.
         </p>
       </div>
 

@@ -367,8 +367,7 @@ function App() {
       </details>
 
       <footer className="app-footer">
-        Schema isolated: <code>port_calculator</code> only — ShopQuote{' '}
-        <code>public</code> tables are untouched.
+        Nick Wall Design · Tool Identifier
       </footer>
     </div>
   )

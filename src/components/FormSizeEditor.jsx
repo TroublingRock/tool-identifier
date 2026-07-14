@@ -145,7 +145,7 @@ export default function FormSizeEditor({
     }
 
     if (!isSupabaseConfigured) {
-      setMsg('Supabase is not configured — cannot save shop sizes.')
+      setMsg('Cloud sync is not configured — cannot save shop sizes.')
       return
     }
 
@@ -527,16 +527,14 @@ export default function FormSizeEditor({
 
           {!isSupabaseConfigured ? (
             <p className="status error">
-              Connect Supabase to persist shop-defined sizes.
+              Cloud sync is not configured — sizes cannot be saved yet.
             </p>
           ) : null}
 
-          {standards.length === 0 ? null : (
-            <p className="empty-hint">
-              New labels create/update a <code>SHOP_*</code> standard in{' '}
-              <code>port_calculator</code> only.
-            </p>
-          )}
+          <p className="empty-hint">
+            New labels are saved as shop standards for optical matching on this
+            device and your connected catalog.
+          </p>
         </form>
       </div>
     </section>
